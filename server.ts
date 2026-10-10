@@ -1,0 +1,1126 @@
+import express from 'express';
+import path from 'path';
+import { createServer as createViteServer } from 'vite';
+import { GoogleGenAI } from '@google/genai';
+import dotenv from 'dotenv';
+import crypto from 'crypto';
+import fs from 'fs';
+
+dotenv.config();
+
+const app = express();
+const PORT = 3000;
+
+app.use(express.json());
+
+// Lazy-initialized Gemini Client
+let aiClient: GoogleGenAI | null = null;
+function getGeminiClient(): GoogleGenAI | null {
+  if (!aiClient && process.env.GEMINI_API_KEY) {
+    aiClient = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+  }
+  return aiClient;
+}
+
+// Built-in intelligent fallback knowledge for Indian agricultural mandis (AP Mandi Reference Dataset & Farm2Door Data)
+const AGRICULTURAL_KNOWLEDGE = {
+  tomatoPrices: {
+    en: "According to Andhra Pradesh APMC mandi records, the modal reference price for Tomato is ₹34.0 per kg (₹3,400 per quintal), with Bowenpally and Kurnool mandis quoting the highest rates. On Farm2Door, farmers sell directly with zero middleman deductions.",
+    hi: "आंध्र प्रदेश मंडी आंकड़ों के अनुसार आज टमाटर का मॉडल संदर्भ भाव ₹34.0 प्रति किलो (₹3,400 प्रति क्विंटल) है। बोवेनपल्ली और कुरनूल मंडियों में सबसे अच्छे संदर्भ भाव दर्ज हैं। फार्म2डोर पर सीधे बेचने से बिचौलियों का कमीशन बचता है।",
+    te: "ఆంధ్రప్రదేశ్ మార్కెట్ రికార్డుల ప్రకారం టమోటా యొక్క మోడల్ రిఫరెన్స్ ధర కేజీకి ₹34.0 (క్వింటాల్‌కు ₹3,400) గా ఉంది. బోవెన్‌పల్లి మరియు కర్నూలు మార్కెట్లలో మంచి ధరలు నమోదయ్యాయి. ఫార్మ్2డోర్ ద్వారా నేరుగా అమ్మితే దళారుల కమీషన్ లేకుండా పూర్తి లాభం లభిస్తుంది."
+  },
+  sellingPriceTomatoes: {
+    en: "On Farm2Door, the listed selling price for fresh tomatoes is ₹34.0 per kg, with ₹27.0 per kg going directly into the farmer's bank account with zero broker deductions.",
+    hi: "फार्म2डोर पर ताजे टमाटर का किसान बिक्री मूल्य ₹34.0 प्रति किलो है, जिसमें से ₹27.0 प्रति किलो बिना किसी बिचौलिये के सीधे किसान के बैंक खाते में आता है।",
+    te: "ఫార్మ్2డోర్‌లో తాజా టమోటా రైతు అమ్మకపు ధర కేజీకి ₹34.0 గా ఉంది, ఇందులో దళారుల కోత లేకుండా ₹27.0 నేరుగా రైతు బ్యాంక్ ఖాతాకు చేరుతుంది."
+  },
+  whereToBuyTomatoes: {
+    en: "You can purchase fresh tomatoes on Farm2Door Marketplace directly from Ramesh Patil (Sahyadri Kisan Producer Co.) at ₹34 per kg with verified farm-gate freshness.",
+    hi: "आप फार्म2डोर मार्केटप्लेस पर रमेश पाटिल (सह्याद्री किसान प्रोड्यूसर कंपनी) से सीधे ₹34 प्रति किलो पर खेत से ताजे तोड़े गए टमाटर खरीद सकते हैं।",
+    te: "మీరు ఫార్మ్2డోర్ మార్కెట్‌ప్లేస్‌లో రమేష్ పాటిల్ (సహ్యాద్రి కిసాన్ ప్రొడ్యూసర్ కో) నుండి కేజీకి ₹34 చొప్పున తోట వద్ద తాజా టమాటాలను నేరుగా కొనవచ్చు."
+  },
+  pendingOrders: {
+    en: "In your Farm2Door orders, you have active orders including Order #F2D-8820 for 250 kg Tomato (Ready for Delivery) and Bulk Sourcing Request BLK-701 for 25 quintals (Pending confirmation).",
+    hi: "आपके फार्म2डोर खाते में सक्रिय ऑर्डर हैं: ऑर्डर #F2D-8820 (250 किलो टमाटर, डिलीवरी के लिए तैयार) और थोक अनुरोध BLK-701 (25 क्विंटल टमाटर, पुष्टि लंबित)।",
+    te: "మీ ఫార్మ్2డోర్ ఖాతాలో యాక్టివ్ ఆర్డర్లు ఉన్నాయి: ఆర్డర్ #F2D-8820 (250 కేజీల టమోటా, డెలివరీకి సిద్ధం) మరియు బల్క్ రిక్వెస్ట్ BLK-701 (25 క్వింటాళ్లు, పెండింగ్)."
+  },
+  pendingDeliveries: {
+    en: "In Farm2Door Smart Logistics, route DR-AP-01 has 2 pending farm-gate dispatches from Gollapudi Agri Yard Hub to Mangalagiri Town and Guntur City Centre.",
+    hi: "फार्म2डोर स्मार्ट लॉजिस्टिक्स में रूट DR-AP-01 पर 2 डिलीवरी लंबित हैं: गोलापुडी एग्री यार्ड हब से मंगलागिरी टाउन और गुंटूर सिटी सेंटर के लिए।",
+    te: "ఫార్మ్2డోర్ స్మార్ట్ లాజిస్టిక్స్‌లో రూట్ DR-AP-01 పై గొల్లపూడి అగ్రి యార్డ్ హబ్ నుండి మంగళగిరి మరియు గుంటూరు నగరాలకు 2 డెలివరీలు పెండింగ్‌లో ఉన్నాయి."
+  },
+  whereToSell: {
+    en: "You have two verified options: 1. Farm2Door collective procurement offers ₹34/kg with farm-gate pickup and 0% commission. 2. In local mandis, Bowenpally and Kurnool record highest rates at ₹34-35/kg.",
+    hi: "आपके पास दो बेहतरीन विकल्प हैं: 1. फार्म2डोर पर सीधे बेचें जहाँ खेत से सीधी पिकअप और 0% कमीशन मिलेगा। 2. स्थानीय मंडियों में बोवेनपल्ली और कुरनूल में सबसे अच्छे संदर्भ रेट ₹34-35 प्रति किलो मिल रहे हैं।",
+    te: "మీ పంటను అమ్మడానికి రెండు మంచి మార్గాలు ఉన్నాయి: 1. ఫార్మ్2డోర్ ద్వారా నేరుగా అమ్ముకుంటే తోట వద్దే కేజీకి ₹34తో పికప్ మరియు సున్నా కమీషన్. 2. స్థానిక మార్కెట్లలో బోవెన్‌పల్లి లేదా కర్నూలు మార్కెట్‌లో ₹34-35 రేటు వస్తుంది."
+  },
+  bestMarket: {
+    en: "Based on Andhra Pradesh mandi records, Bowenpally Market and Kurnool recorded the highest modal reference prices for fresh tomatoes at ₹34-35 per kg.",
+    hi: "आंध्र प्रदेश मंडी रिकॉर्ड के अनुसार बोवेनपल्ली (हैदराबाद) और कुरनूल में टमाटर का सबसे ऊंचा मॉडल संदर्भ भाव ₹34-35 प्रति किलो दर्ज किया गया है।",
+    te: "ఆంధ్రప్రదేశ్ రికార్డుల ప్రకారం బోవెన్‌పల్లి మరియు కర్నూలు మార్కెట్లలో టమోటాకు అత్యధిక మోడల్ రిఫరెన్స్ ధరలు (కేజీకి ₹34-35) నమోదయ్యాయి."
+  },
+  onionPrices: {
+    en: "Today's onion modal reference rate across Andhra Pradesh APMC mandis is ₹28.0 per kg (₹2,800 per quintal). Supply is steady across Kurnool and Nizamabad mandis.",
+    hi: "आंध्र प्रदेश की मंडियों में आज प्याज का मॉडल संदर्भ भाव ₹28.0 प्रति किलो (₹2,800 प्रति क्विंटल) है। कुरनूल और निजामाबाद मंडियों में आवक स्थिर बनी हुई है।",
+    te: "ఆంధ్రప్రదేశ్ APMC మార్కెట్లలో ఉల్లిపాయ మోడల్ రిఫరెన్స్ ధర కేజీకి ₹28.0 (క్వింటాల్‌కు ₹2,800) గా ఉంది. కర్నూలు మరియు నిజామాబాద్ మార్కెట్లలో సరఫరా స్థిరంగా ఉంది."
+  },
+  potatoPrices: {
+    en: "According to Andhra Pradesh APMC records, the potato modal reference price is ₹22.0 per kg (₹2,200 per quintal) with steady market stability across cold storage hubs.",
+    hi: "आंध्र प्रदेश मंडी रिकॉर्ड के अनुसार आज आलू का मॉडल संदर्भ भाव ₹22.0 प्रति किलो (₹2,200 प्रति क्विंटल) है और कोल्ड स्टोरेज केंद्रों में भाव स्थिर बना हुआ है।",
+    te: "ఆంధ్రప్రదేశ్ మార్కెట్ రికార్డుల ప్రకారం బంగాళాదుంప మోడల్ రిఫరెన్స్ ధర కేజీకి ₹22.0 (క్వింటాల్‌కు ₹2,200) గా స్థిరంగా కొనసాగుతోంది."
+  },
+  generalMarketSummary: {
+    en: "Available APMC mandi reference rates on Farm2Door: Tomato ₹34.0/kg (Bowenpally, Kurnool), Onion ₹28.0/kg, and Potato ₹22.0/kg. You can ask for rates of any specific crop.",
+    hi: "फार्म2डोर पर उपलब्ध आज के मुख्य मंडी संदर्भ भाव: टमाटर ₹34.0/किग्रा, प्याज ₹28.0/किग्रा और आलू ₹22.0/किग्रा। आप किसी भी विशिष्ट फसल का भाव पूछ सकते हैं।",
+    te: "ఫార్మ్2డోర్ రికార్డులలో అందుబాటులో ఉన్న ముఖ్య పంటల ధరలు: టమోటా కేజీకి ₹34.0, ఉల్లిపాయ కేజీకి ₹28.0 మరియు బంగాళాదుంప కేజీకి ₹22.0. మీరు నిర్దిష్ట పంట ధరను అడగవచ్చు."
+  },
+  unavailableCrop: {
+    en: "Verified price records for this specific crop are currently not available in Farm2Door data. Available crops with verified rates include Tomato (₹34/kg), Onion (₹28/kg), and Potato (₹22/kg).",
+    hi: "इस फसल की कीमत वर्तमान में फार्म2डोर सत्यापित रिकॉर्ड में उपलब्ध नहीं है। उपलब्ध सत्यापित फसलों में टमाटर (₹34/किग्रा), प्याज (₹28/किग्रा) और आलू (₹22/किग्रा) शामिल हैं।",
+    te: "ఈ పంట యొక్క ప్రస్తుత ధర వివరాలు ఫార్మ్2డోర్ రికార్డులలో అందుబాటులో లేవు. అందుబాటులో ఉన్న ధరలు: టమోటా (కేజీకి ₹34), ఉల్లిపాయ (కేజీకి ₹28), బంగాళాదుంప (కేజీకి ₹22)."
+  },
+  generalAdvice: {
+    en: "Hello! I am your Farm2Door Kisan Assistant. You can ask me about tomato, onion, or potato market rates, check your pending orders, or track logistics dispatches.",
+    hi: "नमस्ते किसान भाई! मैं आपका फार्म2डोर किसान सहायक हूँ। आप मुझसे टमाटर, प्याज या आलू के मंडी भाव, अपने लंबित ऑर्डर या लॉजिस्टिक्स डिलीवरी के बारे में पूछ सकते हैं।",
+    te: "నమస్కారం రైతు మిత్రమా! నేను మీ ఫార్మ్2డోర్ కిసాన్ సహాయకుడిని. మీరు నన్ను టమోటా, ఉల్లిపాయ లేదా బంగాళాదుంప మార్కెట్ ధరలు, మీ పెండింగ్ ఆర్డర్లు లేదా డెలివరీ సమాచారం గురించి అడగవచ్చు."
+  }
+};
+
+// Server-side robust language detection for farmer voice questions
+function detectLanguageServer(text: string, requestedLang?: string, fallbackLang: string = 'en'): 'te' | 'hi' | 'en' {
+  const trimmed = (text || '').trim();
+  const teluguCount = (trimmed.match(/[\u0C00-\u0C7F]/g) || []).length;
+  const devanagariCount = (trimmed.match(/[\u0900-\u097F]/g) || []).length;
+
+  // 1. Script-level detection: ANY Telugu script strictly indicates Telugu
+  if (teluguCount > 0 && teluguCount >= devanagariCount) return 'te';
+  if (devanagariCount > 0) return 'hi';
+
+  // 2. If client or requested language explicitly passed 'te' or 'hi'
+  if (requestedLang === 'te' && devanagariCount === 0) return 'te';
+  if (requestedLang === 'hi' && teluguCount === 0) return 'hi';
+  if (requestedLang === 'en' && teluguCount === 0 && devanagariCount === 0) return 'en';
+
+  // 3. Transliterated keyword detection
+  const lower = trimmed.toLowerCase();
+  const words = lower.split(/[^a-zA-Z0-9]+/);
+
+  const teluguWords = [
+    'eeroju', 'eroju', 'tamata', 'tamato', 'thota', 'dhara', 'dharalu', 'enta', 'enti', 'entha',
+    'ekkada', 'ammali', 'ammukovali', 'panta', 'raithu', 'rythu', 'bhavamu', 'bhavam',
+    'undhi', 'unnadi', 'unnayi', 'marketlo', 'mandilo', 'namaskaram', 'telugu',
+    'ullipaya', 'bangaladumpa', 'aloogadda', 'mirchi', 'manchi', 'kavali', 'chupinchu', 'orders'
+  ];
+  if (teluguWords.some(w => words.includes(w))) return 'te';
+
+  const hindiWords = [
+    'aaj', 'tamatar', 'bhav', 'daam', 'kaha', 'kahan', 'kahaa', 'kya', 'hai', 'hain',
+    'bechna', 'beche', 'kitna', 'kitne', 'kripya', 'namaste', 'bataiye',
+    'pyaj', 'pyaaz', 'aloo', 'dikhao', 'lambit'
+  ];
+  if (hindiWords.some(w => words.includes(w))) return 'hi';
+
+  if (fallbackLang === 'te' || fallbackLang === 'hi') return fallbackLang;
+  return 'en';
+}
+
+function getFallbackAnswer(question: string, lang: string): string {
+  const q = (question || '').toLowerCase().trim();
+  const validLang: 'te' | 'hi' | 'en' = (lang === 'hi' || lang === 'te') ? lang : 'en';
+
+  // 1. Potato price queries (checked FIRST before tomato)
+  if (
+    q.includes('potato') || q.includes('potatoes') ||
+    q.includes('आलू') ||
+    q.includes('బంగాళాదుంప') || q.includes('బంగాళదుంప') || q.includes('ఆలూ') ||
+    q.includes('aloogadda') || q.includes('alu')
+  ) {
+    return AGRICULTURAL_KNOWLEDGE.potatoPrices[validLang];
+  }
+
+  // 2. Onion price queries
+  if (
+    q.includes('onion') || q.includes('onions') ||
+    q.includes('प्याज') || q.includes('प्याज़') ||
+    q.includes('ఉల్లి') || q.includes('ఉల్లిపాయ') ||
+    q.includes('ullipaya') || q.includes('pyaj') || q.includes('pyaaz')
+  ) {
+    return AGRICULTURAL_KNOWLEDGE.onionPrices[validLang];
+  }
+
+  // 3. Pending orders queries
+  if (
+    q.includes('pending') || q.includes('order') || q.includes('orders') ||
+    q.includes('ऑर्डर') || q.includes('आर्डर') || q.includes('लंबित') ||
+    q.includes('ఆర్డర్') || q.includes('ఆర్డర్లు') || q.includes('పెండింగ్')
+  ) {
+    return AGRICULTURAL_KNOWLEDGE.pendingOrders[validLang];
+  }
+
+  // 4. Logistics & deliveries queries
+  if (
+    q.includes('delivery') || q.includes('deliveries') || q.includes('dispatch') || q.includes('logistics') ||
+    q.includes('डिलीवरी') || q.includes('डिलिवरी') || q.includes('लॉजिस्टिक्स') ||
+    q.includes('డెలివరీ') || q.includes('రవాణా') || q.includes('లాజిస్టిక్స్')
+  ) {
+    return AGRICULTURAL_KNOWLEDGE.pendingDeliveries[validLang];
+  }
+
+  // 5. Selling price for tomatoes
+  if (
+    (q.includes('selling') || q.includes('बिक्री') || q.includes('अమ్మకపు') || q.includes('అమ్మే')) &&
+    (q.includes('tomato') || q.includes('टमाटर') || q.includes('టమోటా') || q.includes('టమాటా') || q.includes('tamatar'))
+  ) {
+    return AGRICULTURAL_KNOWLEDGE.sellingPriceTomatoes[validLang];
+  }
+
+  // 6. Buying tomatoes
+  if (
+    (q.includes('buy') || q.includes('खरीद') || q.includes('కొనవచ్చు') || q.includes('కొనుగోలు')) &&
+    (q.includes('tomato') || q.includes('टमाटर') || q.includes('టమోటా') || q.includes('టమాటా'))
+  ) {
+    return AGRICULTURAL_KNOWLEDGE.whereToBuyTomatoes[validLang];
+  }
+
+  // 7. Tomato price queries specifically
+  if (
+    q.includes('tomato') || q.includes('tomatoes') ||
+    q.includes('टमाटर') || q.includes('tamatar') ||
+    q.includes('టమోటా') || q.includes('టమాటా')
+  ) {
+    return AGRICULTURAL_KNOWLEDGE.tomatoPrices[validLang];
+  }
+
+  // 8. Where to sell queries
+  if (
+    q.includes('where to sell') || q.includes('कहाँ बेच') || q.includes('कहा बेच') ||
+    q.includes('ఎక్కడ అమ్మాలి') || q.includes('ఎక్కడ అమ్ముకోవాలి')
+  ) {
+    return AGRICULTURAL_KNOWLEDGE.whereToSell[validLang];
+  }
+
+  // 9. Best market queries
+  if (
+    q.includes('best market') || q.includes('highest price') ||
+    q.includes('सबसे अच्छा') || q.includes('सबसे ऊँचा') || q.includes('सबसे ऊंचा') ||
+    q.includes('మంచి మార్కెట్') || q.includes('అధిక ధర')
+  ) {
+    return AGRICULTURAL_KNOWLEDGE.bestMarket[validLang];
+  }
+
+  // 10. General price queries without crop
+  if (
+    q.includes('price') || q.includes('rate') || q.includes('bhav') ||
+    q.includes('भाव') || q.includes('कीमत') || q.includes('रेट') || q.includes('दाम') ||
+    q.includes('ధర') || q.includes('ధరలు') || q.includes('రేటు')
+  ) {
+    return AGRICULTURAL_KNOWLEDGE.generalMarketSummary[validLang];
+  }
+
+  return AGRICULTURAL_KNOWLEDGE.generalAdvice[validLang];
+}
+
+// ============================================================================
+// SERVER-SIDE AUTHENTICATION & ROLE-BASED ACCESS CONTROL (RBAC)
+// ============================================================================
+
+interface ServerUser {
+  id: string;
+  fullName: string;
+  email: string;
+  contact: string;
+  passwordHash: string;
+  passwordSalt: string;
+  role: 'farmer' | 'consumer' | 'admin' | 'bulk_buyer';
+  language?: string;
+  fpoOrOrgName?: string;
+  location?: string;
+  approvalStatus: 'approved' | 'pending' | 'rejected';
+  createdAt: string;
+}
+
+interface ActiveSession {
+  userId: string;
+  token: string;
+  role: string;
+  expiresAt: number;
+}
+
+// Cryptographic password hashing using PBKDF2 (SHA-512, 10,000 iterations)
+function hashPassword(password: string, salt?: string): { hash: string; salt: string } {
+  const usedSalt = salt || crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(password, usedSalt, 10000, 64, 'sha512').toString('hex');
+  return { hash, salt: usedSalt };
+}
+
+function verifyPassword(password: string, hash: string, salt: string): boolean {
+  try {
+    const computed = crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
+    return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(hash));
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeUser(user: ServerUser) {
+  const { passwordHash, passwordSalt, ...safe } = user;
+  return safe;
+}
+
+// Server user persistence to local json file
+const USERS_FILE = path.join(process.cwd(), 'data', 'users.json');
+
+function loadUsers(): ServerUser[] {
+  try {
+    if (fs.existsSync(USERS_FILE)) {
+      const data = fs.readFileSync(USERS_FILE, 'utf-8');
+      return JSON.parse(data);
+    }
+  } catch (err) {
+    console.warn('Could not read existing users file, creating fresh data store:', err);
+  }
+  return [];
+}
+
+function saveUsers(usersList: ServerUser[]) {
+  try {
+    const dir = path.dirname(USERS_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(USERS_FILE, JSON.stringify(usersList, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Failed to write users file:', err);
+  }
+}
+
+// Initialize server users
+let serverUsers: ServerUser[] = loadUsers();
+
+// Predefined default administrator account (Required by specification)
+const DEFAULT_ADMIN_EMAIL = 'mdarshnaqi786@gmail.com';
+const existingAdmin = serverUsers.find(
+  (u) => u.email?.toLowerCase() === DEFAULT_ADMIN_EMAIL.toLowerCase() || (u.role === 'admin' && u.fullName === 'naqi')
+);
+
+if (!existingAdmin) {
+  const { hash, salt } = hashPassword('123456');
+  const defaultAdmin: ServerUser = {
+    id: 'usr-admin-naqi',
+    fullName: 'naqi',
+    email: DEFAULT_ADMIN_EMAIL,
+    contact: DEFAULT_ADMIN_EMAIL,
+    passwordHash: hash,
+    passwordSalt: salt,
+    role: 'admin',
+    language: 'en',
+    approvalStatus: 'approved',
+    createdAt: '2026-01-01T00:00:00.000Z',
+  };
+  serverUsers.unshift(defaultAdmin);
+  saveUsers(serverUsers);
+}
+
+// Initialize default seed farmers if none present
+if (!serverUsers.some((u) => u.role === 'farmer')) {
+  const rameshHash = hashPassword('123456');
+  const sureshHash = hashPassword('123456');
+  const ananyaHash = hashPassword('123456');
+  const priyaHash = hashPassword('123456');
+
+  serverUsers.push(
+    {
+      id: 'usr-farmer-ramesh',
+      fullName: 'Ramesh Patil',
+      contact: '+91 98765 43210',
+      email: 'ramesh.patil@kisan.in',
+      passwordHash: rameshHash.hash,
+      passwordSalt: rameshHash.salt,
+      role: 'farmer',
+      language: 'hi',
+      fpoOrOrgName: 'Sahyadri Kisan Producer Co.',
+      location: 'Nashik, Maharashtra',
+      approvalStatus: 'approved',
+      createdAt: '2026-03-01T08:30:00.000Z',
+    },
+    {
+      id: 'usr-farmer-suresh',
+      fullName: 'Suresh Kumar',
+      contact: '+91 91234 56789',
+      email: 'suresh.k@kisanmail.in',
+      passwordHash: sureshHash.hash,
+      passwordSalt: sureshHash.salt,
+      role: 'farmer',
+      language: 'te',
+      fpoOrOrgName: 'Krishna Valley Organic FPO',
+      location: 'Guntur, Andhra Pradesh',
+      approvalStatus: 'pending',
+      createdAt: '2026-09-08T10:15:00.000Z',
+    },
+    {
+      id: 'usr-farmer-ananya',
+      fullName: 'Ananya Reddy',
+      contact: '+91 99887 76655',
+      email: 'ananya.reddy@farmfresh.in',
+      passwordHash: ananyaHash.hash,
+      passwordSalt: ananyaHash.salt,
+      role: 'farmer',
+      language: 'te',
+      fpoOrOrgName: 'Rayalaseema Agro Producers',
+      location: 'Kurnool, Andhra Pradesh',
+      approvalStatus: 'pending',
+      createdAt: '2026-09-09T14:40:00.000Z',
+    },
+    {
+      id: 'usr-consumer-priya',
+      fullName: 'Priya Sharma',
+      contact: 'priya.sharma@example.com',
+      email: 'priya.sharma@example.com',
+      passwordHash: priyaHash.hash,
+      passwordSalt: priyaHash.salt,
+      role: 'consumer',
+      language: 'en',
+      approvalStatus: 'approved',
+      createdAt: '2026-03-05T12:00:00.000Z',
+    }
+  );
+  saveUsers(serverUsers);
+}
+
+// Active session token store
+const activeSessions = new Map<string, ActiveSession>();
+
+// Middleware: Authenticate Bearer Token
+function authenticateToken(req: any, res: any, next: any) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'unauthorized', message: 'Authentication required. Please log in.' });
+  }
+  const token = authHeader.substring(7);
+  const session = activeSessions.get(token);
+  if (!session || session.expiresAt < Date.now()) {
+    if (session) activeSessions.delete(token);
+    return res.status(401).json({ error: 'invalid_token', message: 'Session expired. Please log in again.' });
+  }
+  const user = serverUsers.find((u) => u.id === session.userId);
+  if (!user) {
+    return res.status(401).json({ error: 'user_not_found', message: 'User account not found.' });
+  }
+  req.user = user;
+  req.token = token;
+  next();
+}
+
+// Middleware: Require Admin role on the server
+function requireAdmin(req: any, res: any, next: any) {
+  authenticateToken(req, res, () => {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({
+        error: 'forbidden',
+        message: 'Access denied. Administrative privileges are required for this action.',
+      });
+    }
+    next();
+  });
+}
+
+// ----------------------------------------------------------------------------
+// SERVER PRICE RANGE PERSISTENCE & HELPERS
+// ----------------------------------------------------------------------------
+
+interface ServerPriceRange {
+  id: string;
+  productName: string;
+  category?: string;
+  minPrice: number;
+  maxPrice: number;
+  unit: string;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+const PRICE_RANGES_FILE = path.join(process.cwd(), 'data', 'price_ranges.json');
+
+const INITIAL_SERVER_PRICE_RANGES: ServerPriceRange[] = [
+  { id: 'tomato', productName: 'Tomato', category: 'Vegetables', minPrice: 20, maxPrice: 35, unit: 'kg', updatedAt: 'Today', updatedBy: 'Admin (naqi)' },
+  { id: 'onion', productName: 'Onion', category: 'Vegetables', minPrice: 25, maxPrice: 40, unit: 'kg', updatedAt: 'Today', updatedBy: 'Admin (naqi)' },
+  { id: 'rice', productName: 'Rice', category: 'Grains', minPrice: 40, maxPrice: 75, unit: 'kg', updatedAt: 'Today', updatedBy: 'Admin (naqi)' },
+  { id: 'potato', productName: 'Potato', category: 'Vegetables', minPrice: 18, maxPrice: 30, unit: 'kg', updatedAt: 'Today', updatedBy: 'Admin (naqi)' },
+  { id: 'mango', productName: 'Mango', category: 'Fruits', minPrice: 60, maxPrice: 160, unit: 'kg', updatedAt: 'Today', updatedBy: 'Admin (naqi)' },
+  { id: 'banana', productName: 'Banana', category: 'Fruits', minPrice: 25, maxPrice: 45, unit: 'kg', updatedAt: 'Today', updatedBy: 'Admin (naqi)' },
+  { id: 'green-chilli', productName: 'Green Chilli', category: 'Vegetables', minPrice: 35, maxPrice: 70, unit: 'kg', updatedAt: 'Today', updatedBy: 'Admin (naqi)' },
+  { id: 'pulses-dal', productName: 'Pulses / Dal', category: 'Pulses', minPrice: 85, maxPrice: 140, unit: 'kg', updatedAt: 'Today', updatedBy: 'Admin (naqi)' },
+  { id: 'spices-turmeric', productName: 'Spices / Turmeric', category: 'Spices', minPrice: 120, maxPrice: 220, unit: 'kg', updatedAt: 'Today', updatedBy: 'Admin (naqi)' },
+  { id: 'dairy-ghee', productName: 'Dairy / Ghee', category: 'Dairy Products', minPrice: 450, maxPrice: 900, unit: 'kg', updatedAt: 'Today', updatedBy: 'Admin (naqi)' }
+];
+
+function loadServerPriceRanges(): ServerPriceRange[] {
+  try {
+    if (fs.existsSync(PRICE_RANGES_FILE)) {
+      const data = fs.readFileSync(PRICE_RANGES_FILE, 'utf-8');
+      const parsed = JSON.parse(data);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    }
+  } catch (err) {
+    console.warn('Could not read existing price ranges file, using default seed:', err);
+  }
+  return INITIAL_SERVER_PRICE_RANGES;
+}
+
+function saveServerPriceRanges(ranges: ServerPriceRange[]) {
+  try {
+    const dir = path.dirname(PRICE_RANGES_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(PRICE_RANGES_FILE, JSON.stringify(ranges, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Failed to write price ranges file:', err);
+  }
+}
+
+let serverPriceRanges: ServerPriceRange[] = loadServerPriceRanges();
+
+function findServerPriceRange(productName: string): ServerPriceRange | null {
+  if (!productName || !productName.trim()) return null;
+  const trimmed = productName.trim().toLowerCase();
+  
+  // Exact match
+  const exact = serverPriceRanges.find((r) => r.productName.toLowerCase() === trimmed);
+  if (exact) return exact;
+
+  // Normalized ID match
+  const slug = trimmed.replace(/[^a-z0-9]/g, '-');
+  const idMatch = serverPriceRanges.find((r) => r.id.toLowerCase() === slug || slug.includes(r.id.toLowerCase()));
+  if (idMatch) return idMatch;
+
+  // Substring match
+  const subMatch = serverPriceRanges.find((r) => {
+    const rName = r.productName.toLowerCase();
+    return trimmed.includes(rName) || rName.includes(trimmed);
+  });
+  if (subMatch) return subMatch;
+
+  return null;
+}
+
+// ----------------------------------------------------------------------------
+// AUTH ROUTE: POST /api/auth/register
+// ----------------------------------------------------------------------------
+app.post('/api/auth/register', (req, res) => {
+  const { role, fullName, email, contact, password, farmLocation, fpoName, language } = req.body;
+
+  if (!fullName || (!email && !contact) || !password) {
+    return res.status(400).json({ error: 'missing_fields', message: 'Please fill in all required fields.' });
+  }
+
+  // Security Rule 1: Admin role CANNOT be created through public signup
+  if (role === 'admin') {
+    return res.status(403).json({
+      error: 'admin_signup_forbidden',
+      message: 'Admin accounts cannot be created through public registration.',
+    });
+  }
+
+  const rawIdentifier = (email || contact || '').trim().toLowerCase();
+
+  // Security Rule 2: Do not allow another user to register the predefined admin account
+  if (rawIdentifier === DEFAULT_ADMIN_EMAIL.toLowerCase()) {
+    return res.status(400).json({
+      error: 'reserved_email',
+      message: 'This email is reserved for the platform administrator.',
+    });
+  }
+
+  // Check if email/contact already registered
+  const existing = serverUsers.find(
+    (u) => u.email?.toLowerCase() === rawIdentifier || u.contact?.toLowerCase() === rawIdentifier
+  );
+  if (existing) {
+    return res.status(400).json({
+      error: 'user_exists',
+      message: 'An account with this email/mobile already exists. Please log in instead.',
+    });
+  }
+
+  // Hash password securely with PBKDF2 + salt
+  const { hash, salt } = hashPassword(password);
+  const targetRole = role === 'farmer' ? 'farmer' : 'consumer';
+  const approvalStatus = targetRole === 'farmer' ? 'pending' : 'approved';
+
+  const newUser: ServerUser = {
+    id: `usr-${targetRole}-${Date.now()}`,
+    fullName: fullName.trim(),
+    email: rawIdentifier,
+    contact: (contact || email || '').trim(),
+    passwordHash: hash,
+    passwordSalt: salt,
+    role: targetRole,
+    language: language || 'en',
+    location: farmLocation || '',
+    fpoOrOrgName: fpoName || '',
+    approvalStatus,
+    createdAt: new Date().toISOString(),
+  };
+
+  serverUsers.push(newUser);
+  saveUsers(serverUsers);
+
+  // If Farmer, account is created with status "Pending" and farmer cannot access features yet
+  if (approvalStatus === 'pending') {
+    return res.status(201).json({
+      success: true,
+      requiresApproval: true,
+      approvalStatus: 'pending',
+      message: 'Farmer account registered successfully. Your account is waiting for admin approval before you can access farmer features.',
+      user: sanitizeUser(newUser),
+    });
+  }
+
+  // Customer account is created and logged in normally
+  const token = crypto.randomBytes(32).toString('hex');
+  activeSessions.set(token, {
+    userId: newUser.id,
+    token,
+    role: newUser.role,
+    expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+  });
+
+  return res.status(201).json({
+    success: true,
+    token,
+    user: sanitizeUser(newUser),
+    message: 'Customer account registered successfully.',
+  });
+});
+
+// ----------------------------------------------------------------------------
+// AUTH ROUTE: POST /api/auth/login
+// ----------------------------------------------------------------------------
+app.post('/api/auth/login', (req, res) => {
+  const { role, emailOrContact, email, password } = req.body;
+  const inputIdentifier = (emailOrContact || email || '').trim().toLowerCase();
+
+  if (!inputIdentifier || !password) {
+    return res.status(400).json({ error: 'missing_fields', message: 'Email/Mobile and password are required.' });
+  }
+
+  // Find user by email or contact
+  const user = serverUsers.find(
+    (u) => u.email?.toLowerCase() === inputIdentifier || u.contact?.toLowerCase() === inputIdentifier
+  );
+
+  if (!user) {
+    return res.status(401).json({
+      error: 'invalid_credentials',
+      message: 'Invalid credentials. Please verify your email/mobile and password.',
+    });
+  }
+
+  // Verify password using timing-safe PBKDF2 comparison
+  const isValid = verifyPassword(password, user.passwordHash, user.passwordSalt);
+  if (!isValid) {
+    return res.status(401).json({
+      error: 'invalid_credentials',
+      message: 'Invalid credentials. Please verify your email/mobile and password.',
+    });
+  }
+
+  // Check role match (admin can log in from admin portal or general login)
+  if (role && role !== user.role && user.role !== 'admin') {
+    return res.status(403).json({
+      error: 'role_mismatch',
+      message: `This account is registered as a ${user.role}, not as a ${role}.`,
+    });
+  }
+
+  // Farmer Approval Verification Flow:
+  // If farmer has not been approved, show clear message and block protected functionality
+  if (user.role === 'farmer') {
+    if (user.approvalStatus === 'pending') {
+      return res.status(403).json({
+        error: 'pending_approval',
+        approvalStatus: 'pending',
+        message: 'Your farmer account is waiting for admin approval. You cannot access farmer features until approved.',
+        user: sanitizeUser(user),
+      });
+    }
+
+    if (user.approvalStatus === 'rejected') {
+      return res.status(403).json({
+        error: 'rejected',
+        approvalStatus: 'rejected',
+        message: 'Your farmer account application was rejected by the administrator. Protected farmer features are unavailable.',
+        user: sanitizeUser(user),
+      });
+    }
+  }
+
+  // Generate secure token session
+  const token = crypto.randomBytes(32).toString('hex');
+  activeSessions.set(token, {
+    userId: user.id,
+    token,
+    role: user.role,
+    expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+  });
+
+  return res.json({
+    success: true,
+    token,
+    user: sanitizeUser(user),
+    message: `Logged in successfully as ${user.role}.`,
+  });
+});
+
+// ----------------------------------------------------------------------------
+// AUTH ROUTE: GET /api/auth/me
+// ----------------------------------------------------------------------------
+app.get('/api/auth/me', authenticateToken, (req: any, res) => {
+  return res.json({
+    success: true,
+    user: sanitizeUser(req.user),
+  });
+});
+
+// ----------------------------------------------------------------------------
+// AUTH ROUTE: POST /api/auth/logout
+// ----------------------------------------------------------------------------
+app.post('/api/auth/logout', (req: any, res) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    const token = authHeader.substring(7);
+    activeSessions.delete(token);
+  }
+  return res.json({ success: true, message: 'Logged out successfully.' });
+});
+
+// ----------------------------------------------------------------------------
+// ADMIN ROUTE: GET /api/admin/farmers (Admin only)
+// ----------------------------------------------------------------------------
+app.get('/api/admin/farmers', requireAdmin, (req, res) => {
+  const farmers = serverUsers
+    .filter((u) => u.role === 'farmer')
+    .map((u) => sanitizeUser(u));
+
+  const stats = {
+    total: farmers.length,
+    pending: farmers.filter((f) => f.approvalStatus === 'pending').length,
+    approved: farmers.filter((f) => f.approvalStatus === 'approved').length,
+    rejected: farmers.filter((f) => f.approvalStatus === 'rejected').length,
+  };
+
+  return res.json({
+    success: true,
+    farmers,
+    stats,
+  });
+});
+
+// ----------------------------------------------------------------------------
+// ADMIN ROUTE: POST /api/admin/farmers/:id/status (Admin only)
+// ----------------------------------------------------------------------------
+app.post('/api/admin/farmers/:id/status', requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+
+  if (!['approved', 'rejected', 'pending'].includes(status)) {
+    return res.status(400).json({
+      error: 'invalid_status',
+      message: 'Status must be approved, rejected, or pending.',
+    });
+  }
+
+  const farmer = serverUsers.find((u) => u.id === id && u.role === 'farmer');
+  if (!farmer) {
+    return res.status(404).json({ error: 'not_found', message: 'Farmer not found.' });
+  }
+
+  farmer.approvalStatus = status;
+  saveUsers(serverUsers);
+
+  return res.json({
+    success: true,
+    message: `Farmer ${farmer.fullName} status updated to ${status}.`,
+    farmer: sanitizeUser(farmer),
+  });
+});
+
+// ----------------------------------------------------------------------------
+// ADMIN ROUTE: POST /api/admin/change-password (Admin only)
+// ----------------------------------------------------------------------------
+app.post('/api/admin/change-password', requireAdmin, (req: any, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ error: 'missing_fields', message: 'Current and new password are required.' });
+  }
+  if (newPassword.length < 6) {
+    return res.status(400).json({ error: 'weak_password', message: 'New password must be at least 6 characters.' });
+  }
+
+  const adminUser = serverUsers.find((u) => u.id === req.user.id);
+  if (!adminUser) {
+    return res.status(404).json({ error: 'user_not_found', message: 'Admin user not found.' });
+  }
+
+  const isValid = verifyPassword(currentPassword, adminUser.passwordHash, adminUser.passwordSalt);
+  if (!isValid) {
+    return res.status(401).json({ error: 'wrong_password', message: 'Current password is incorrect.' });
+  }
+
+  const { hash, salt } = hashPassword(newPassword);
+  adminUser.passwordHash = hash;
+  adminUser.passwordSalt = salt;
+  saveUsers(serverUsers);
+
+  return res.json({
+    success: true,
+    message: 'Admin password updated securely.',
+  });
+});
+
+// ----------------------------------------------------------------------------
+// ADMIN ROUTE: GET /api/admin/users (Admin only)
+// ----------------------------------------------------------------------------
+app.get('/api/admin/users', requireAdmin, (req, res) => {
+  const users = serverUsers.map((u) => sanitizeUser(u));
+  return res.json({ success: true, users });
+});
+
+// ----------------------------------------------------------------------------
+// PRICE RANGES ROUTES (Product Price Management)
+// ----------------------------------------------------------------------------
+
+// Public & Farmer read access to Admin-defined price ranges
+app.get(['/api/price-ranges', '/api/admin/price-ranges'], (req, res) => {
+  return res.json({
+    success: true,
+    priceRanges: serverPriceRanges,
+  });
+});
+
+// Admin save or update price range
+app.post('/api/admin/price-ranges', (req: any, res) => {
+  const { id, productName, category, minPrice, maxPrice, unit, updatedBy } = req.body;
+
+  if (!productName || typeof productName !== 'string' || !productName.trim()) {
+    return res.status(400).json({ error: 'invalid_product_name', message: 'Product name is required.' });
+  }
+
+  const numMin = Number(minPrice);
+  const numMax = Number(maxPrice);
+
+  if (isNaN(numMin) || numMin < 0) {
+    return res.status(400).json({ error: 'invalid_min_price', message: 'Minimum price must be a valid number >= 0.' });
+  }
+
+  if (isNaN(numMax) || numMax < 0) {
+    return res.status(400).json({ error: 'invalid_max_price', message: 'Maximum price must be a valid number >= 0.' });
+  }
+
+  if (numMax < numMin) {
+    return res.status(400).json({
+      error: 'invalid_range',
+      message: 'Maximum price must be greater than or equal to Minimum price.',
+    });
+  }
+
+  const rangeId = id || productName.trim().toLowerCase().replace(/[^a-z0-9]/g, '-') || `range-${Date.now()}`;
+  const newRange: ServerPriceRange = {
+    id: rangeId,
+    productName: productName.trim(),
+    category: category || 'Vegetables',
+    minPrice: numMin,
+    maxPrice: numMax,
+    unit: unit || 'kg',
+    updatedAt: new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
+    updatedBy: updatedBy || 'Admin',
+  };
+
+  const existingIdx = serverPriceRanges.findIndex(
+    (r) => r.id === rangeId || r.productName.toLowerCase() === newRange.productName.toLowerCase()
+  );
+
+  if (existingIdx >= 0) {
+    serverPriceRanges[existingIdx] = newRange;
+  } else {
+    serverPriceRanges.unshift(newRange);
+  }
+
+  saveServerPriceRanges(serverPriceRanges);
+
+  return res.json({
+    success: true,
+    message: `Price range for "${newRange.productName}" saved: ₹${newRange.minPrice}–₹${newRange.maxPrice}/${newRange.unit}.`,
+    priceRange: newRange,
+  });
+});
+
+// Admin delete price range
+app.delete('/api/admin/price-ranges/:id', (req, res) => {
+  const { id } = req.params;
+  const initialLen = serverPriceRanges.length;
+  serverPriceRanges = serverPriceRanges.filter((r) => r.id !== id);
+
+  if (serverPriceRanges.length === initialLen) {
+    return res.status(404).json({ error: 'not_found', message: 'Price range not found.' });
+  }
+
+  saveServerPriceRanges(serverPriceRanges);
+  return res.json({ success: true, message: 'Price range deleted.' });
+});
+
+// Backend validation helper
+function validateServerPrice(productName: string, price: number, unit?: string) {
+  const range = findServerPriceRange(productName);
+  if (!range) {
+    return {
+      valid: false,
+      hasConfiguredRange: false,
+      message: '⚠️ Admin price range has not been configured for this product. Please contact Admin.',
+      range: null,
+    };
+  }
+
+  const numPrice = Number(price);
+  if (isNaN(numPrice) || numPrice <= 0) {
+    return {
+      valid: false,
+      hasConfiguredRange: true,
+      message: `Price must be between ₹${range.minPrice} and ₹${range.maxPrice} per ${range.unit} as defined by Admin.`,
+      range,
+      minPrice: range.minPrice,
+      maxPrice: range.maxPrice,
+      unit: range.unit,
+    };
+  }
+
+  if (numPrice < range.minPrice || numPrice > range.maxPrice) {
+    return {
+      valid: false,
+      hasConfiguredRange: true,
+      message: `Price must be between ₹${range.minPrice} and ₹${range.maxPrice} per ${range.unit} as defined by Admin.`,
+      range,
+      minPrice: range.minPrice,
+      maxPrice: range.maxPrice,
+      unit: range.unit,
+    };
+  }
+
+  return {
+    valid: true,
+    hasConfiguredRange: true,
+    message: 'Valid price. Product can be listed.',
+    range,
+    minPrice: range.minPrice,
+    maxPrice: range.maxPrice,
+    unit: range.unit,
+  };
+}
+
+// Backend validation endpoint
+app.post('/api/products/validate-price', (req, res) => {
+  const { productName, price, unit } = req.body;
+  if (!productName) {
+    return res.status(400).json({ valid: false, message: 'Product name is required.' });
+  }
+
+  const result = validateServerPrice(productName, price, unit);
+  return res.status(200).json(result);
+});
+
+// Backend product verification before listing (enforces backend validation)
+app.post('/api/products/verify-and-list', (req, res) => {
+  const { name, pricePerUnit, unit } = req.body;
+  if (!name || pricePerUnit === undefined) {
+    return res.status(400).json({ error: 'missing_fields', message: 'Product name and price are required.' });
+  }
+
+  const result = validateServerPrice(name, pricePerUnit, unit);
+  if (!result.valid) {
+    return res.status(400).json({
+      error: result.hasConfiguredRange ? 'price_out_of_range' : 'no_admin_range',
+      message: result.message,
+      range: result.range,
+    });
+  }
+
+  return res.json({
+    success: true,
+    message: result.message,
+    range: result.range,
+  });
+});
+
+// Health Check API Endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Kisan Voice Assistant API Endpoint
+app.post('/api/kisan-assistant', async (req, res) => {
+  const { question, language, preferredLanguage, detectedLanguage, mandiDataContext } = req.body;
+
+  if (!question || typeof question !== 'string') {
+    return res.status(400).json({ error: 'Question is required' });
+  }
+
+  // Language priority:
+  // 1. Explicit detectedLanguage / language requested
+  // 2. Language spoken/written in current question
+  // 3. Preferred language
+  const targetLangParam = detectedLanguage || language || preferredLanguage;
+  const fallbackLang = preferredLanguage || language || 'en';
+  const detectedLang: 'te' | 'hi' | 'en' = detectLanguageServer(question, targetLangParam, fallbackLang);
+
+  try {
+    const ai = getGeminiClient();
+    if (ai) {
+      let languageInstructions = '';
+      if (detectedLang === 'te') {
+        languageInstructions = `CRITICAL LANGUAGE REQUIREMENT FOR TELUGU:
+The user is asking in Telugu (తెలుగు).
+You MUST generate the explanation completely in Telugu using Telugu script (తెలుగు లిపి).
+DO NOT mix English sentences into the answer. Do not say "Tomato price is".
+Instead, write: "ఈరోజు టమాటా యొక్క మార్కెట్ రిఫరెన్స్ ధర కిలోకు ₹34.0 గా ఉంది."
+Keep product names, market names (Bowenpally, Kurnool), and numbers in natural script/notation, but the entire explanation must be in Telugu.`;
+      } else if (detectedLang === 'hi') {
+        languageInstructions = `CRITICAL LANGUAGE REQUIREMENT FOR HINDI:
+The user is asking in Hindi (हिन्दी).
+You MUST generate the explanation completely in Hindi using Devanagari script (देवनागरी).
+Do not output English words. Answer specifically for the user's actual question.`;
+      } else {
+        languageInstructions = `CRITICAL LANGUAGE REQUIREMENT FOR ENGLISH:
+The user is asking in English.
+Respond in clear, concise, farmer-friendly English.`;
+      }
+
+      const systemInstruction = `You are Farm2Door AI Kisan Assistant.
+
+Answer the user's CURRENT question based on its actual meaning.
+
+Never return the same answer merely because two questions are in the same language.
+
+Always understand the current question before answering.
+
+If the user asks about market prices, use available Farm2Door market data:
+- Tomato modal reference rate: ₹34.0 per kg (₹3,400 per quintal), recorded in Andhra Pradesh APMC mandis (Bowenpally, Kurnool).
+- Onion modal reference rate: ₹28.0 per kg (₹2,800 per quintal), recorded in Andhra Pradesh APMC mandis (Kurnool, Nizamabad).
+- Potato modal reference rate: ₹22.0 per kg (₹2,200 per quintal), recorded in Andhra Pradesh APMC mandis.
+- Rice modal rate: ₹42.0 per kg.
+- Wheat modal rate: ₹31.0 per kg.
+
+If the user asks about products, orders, logistics, or marketplace information, use the application's available data:
+- Farmer tomato selling price listed on Farm2Door: ₹34.0 per kg (with ₹27.0/kg direct payout to farmer bank account, 0% middleman deduction).
+- Buying fresh tomatoes on Farm2Door: Direct from Ramesh Patil (Sahyadri Kisan Producer Co.) at ₹34/kg with farm-gate verified quality.
+- Pending orders on Farm2Door: Order #F2D-8820 for 250 kg Tomato (Ready for Delivery), and Bulk Sourcing Request BLK-701 for 25 quintals Tomato (Pending confirmation).
+- Logistics dispatches: Route DR-AP-01 with 2 pending dispatches from Gollapudi Agri Yard Hub to Mangalagiri Town and Guntur City Centre.
+- Best markets to sell: Farm2Door for direct farm-gate collection with 0% broker commission, or Bowenpally and Kurnool mandis for local markets.
+${mandiDataContext ? `Application Data Context: "${mandiDataContext}"` : ''}
+
+Never invent unavailable information. If the requested price exists in Farm2Door data, use it. If it does not exist (such as an unknown crop), clearly say that the requested information is not available in Farm2Door records. Do not claim that a price is "today's live price" unless the application actually has live data.
+
+Answer in the SAME LANGUAGE as the user's question:
+- Hindi question → complete answer in Hindi using Devanagari script.
+- Telugu question → complete answer in Telugu using Telugu script. The explanation must be in Telugu.
+- English question → complete answer in English.
+
+${languageInstructions}
+
+Keep product names, market names, customer names, and unavoidable technical terms unchanged when necessary, but explain the surrounding information in the user's language.
+Keep the answer concise (2 to 3 sentences, 35-50 words) so it is natural and clear for speech synthesis.`;
+
+      let response: any = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          response = await ai.models.generateContent({
+            model: 'gemini-3.8-flash',
+            contents: question,
+            config: {
+              systemInstruction,
+              temperature: 0.2,
+            },
+          });
+          if (response?.text) break;
+        } catch (err: any) {
+          console.warn(`Gemini attempt ${attempt + 1} failed:`, err?.message || err);
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 500));
+          }
+        }
+      }
+
+      const aiAnswer = response?.text?.trim();
+
+      // Guard against LLM accidentally defaulting to English for Telugu/Hindi
+      let isValidLanguageResponse = true;
+      if (detectedLang === 'te' && (!aiAnswer || !/[\u0C00-\u0C7F]/.test(aiAnswer))) {
+        console.warn('Gemini did not return Telugu script for Telugu inquiry, using verified question-aware Telugu fallback');
+        isValidLanguageResponse = false;
+      } else if (detectedLang === 'hi' && (!aiAnswer || !/[\u0900-\u097F]/.test(aiAnswer))) {
+        console.warn('Gemini did not return Devanagari script for Hindi inquiry, using verified question-aware Hindi fallback');
+        isValidLanguageResponse = false;
+      }
+
+      if (aiAnswer && isValidLanguageResponse) {
+        return res.json({
+          answer: aiAnswer,
+          source: 'gemini',
+          language: detectedLang,
+          detectedLanguage: detectedLang,
+        });
+      }
+    }
+
+    // Fallback if Gemini key is missing, empty response, or wrong language script returned
+    const fallbackAnswer = getFallbackAnswer(question, detectedLang);
+    return res.json({
+      answer: fallbackAnswer,
+      source: 'agricultural-intelligence',
+      language: detectedLang,
+      detectedLanguage: detectedLang,
+    });
+  } catch (error) {
+    console.error('Kisan Assistant Error:', error);
+    const fallbackAnswer = getFallbackAnswer(question, detectedLang);
+    return res.json({
+      answer: fallbackAnswer,
+      source: 'agricultural-intelligence-fallback',
+      language: detectedLang,
+      detectedLanguage: detectedLang,
+    });
+  }
+});
+
+// Start server with Vite middleware in dev or static files in production
+async function startServer() {
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { 
+        middlewareMode: true,
+        hmr: false,
+      },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Farm2Door Server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer();
